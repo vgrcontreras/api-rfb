@@ -16,6 +16,9 @@ import requests
 import urllib.request
 import wget
 import zipfile
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 def check_diff(url, file_name):
@@ -80,7 +83,12 @@ if not os.path.isfile(dotenv_path):
 print(dotenv_path)
 load_dotenv(dotenv_path=dotenv_path)
 
-dados_rf = 'http://200.152.38.155/CNPJ/'
+# URL de referencia da receita para baixar os arquivos .zip
+base_url = input("Please enter the base URL (e.g., http://200.152.38.155/CNPJ/dados_abertos_cnpj/2024-09/): ").strip()
+
+if not base_url.startswith("http://") and not base_url.startswith("https://"):
+    print("Invalid URL. Please make sure it starts with 'http://' or 'https://'.")
+    exit(1)
 
 #%%
 # Read details from ".env" file:
@@ -101,7 +109,7 @@ except:
     print('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
 
 #%%
-raw_html = urllib.request.urlopen(dados_rf)
+raw_html = urllib.request.urlopen(base_url)
 raw_html = raw_html.read()
 
 # Formatar página e converter em string
@@ -154,11 +162,46 @@ for l in Files:
     # Download dos arquivos
     i_l += 1
     print('Baixando arquivo:')
-    print(str(i_l) + ' - ' + l)
-    url = dados_rf+l
-    file_name = os.path.join(output_files, l)
-    if check_diff(url, file_name):
-        wget.download(url, out=output_files, bar=bar_progress)
+
+
+    # Configurar cabeçalhos e retentativas
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    retry_strategy = Retry(
+    total=5, # Tenta até 5 vezes
+    backoff_factor=1, # Aumenta o tempo de espera entre as tentativas
+    status_forcelist=[429, 500, 502, 503, 504], # Requer retentativas em erros comuns
+    allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    http = requests.Session()
+    http.mount("https://", adapter)
+    http.mount("http://", adapter)
+
+    # Testar conexão com a URL antes de iniciar os downloads
+    try:
+        test_response = requests.head(base_url, headers={'User-Agent': 'Mozilla/5.0'})
+        if test_response.status_code == 200:
+            print("Conexão com o servidor bem-sucedida!")
+        else:
+            print(f"Erro: O servidor respondeu com status {test_response.status_code}.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Erro ao conectar ao servidor: {e}")
+        sys.exit(1)
+
+
+    # Realizar download com tratamento de erros
+    try:
+        url = base_url + l # URL completa para o arquivo
+        print(f"Baixando arquivo: {url}")
+        response = http.get(url, headers=headers, timeout=10)
+        response.raise_for_status() # Levanta erro se o status não for 200
+
+        with open(os.path.join(output_files, l), 'wb') as f:
+            f.write(response.content)
+            print(f"Arquivo {l} baixado com sucesso!")
+    except requests.exceptions.RequestException as e:
+        print(f"Erro ao baixar o arquivo {l}: {e}")
 
 #%%
 # Download layout:
@@ -250,8 +293,12 @@ print("""
 #######################
 """)
 
+# Create rfb schema
+cur.execute('CREATE SCHEMA IF NOT EXISTS rfb')
+conn.commit()
+
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "empresa";')
+cur.execute('DROP TABLE IF EXISTS "rfb.empresa";')
 conn.commit()
 
 for e in range(0, len(arquivos_empresa)):
@@ -287,7 +334,7 @@ for e in range(0, len(arquivos_empresa)):
 
     # Gravar dados no banco:
     # Empresa
-    to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False)
+    to_sql(empresa, name='empresa', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_empresa[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -309,7 +356,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "estabelecimento";')
+cur.execute('DROP TABLE IF EXISTS "rfb.estabelecimento";')
 conn.commit()
 
 print('Tem %i arquivos de estabelecimento!' % len(arquivos_estabelecimento))
@@ -380,7 +427,7 @@ for e in range(0, len(arquivos_estabelecimento)):
 
         # Gravar dados no banco:
         # estabelecimento
-        to_sql(estabelecimento, name='estabelecimento', con=engine, if_exists='append', index=False)
+        to_sql(estabelecimento, name='estabelecimento', schema='rfb', con=engine, if_exists='append', index=False)
         print('Arquivo ' + arquivos_estabelecimento[e] + ' / ' + str(part) + ' inserido com sucesso no banco de dados!')
         if len(estabelecimento) == NROWS:
             part += 1
@@ -406,7 +453,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "socios";')
+cur.execute('DROP TABLE IF EXISTS "rfb.socios";')
 conn.commit()
 
 for e in range(0, len(arquivos_socios)):
@@ -447,7 +494,7 @@ for e in range(0, len(arquivos_socios)):
 
     # Gravar dados no banco:
     # socios
-    to_sql(socios, name='socios', con=engine, if_exists='append', index=False)
+    to_sql(socios, name='socios', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_socios[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -469,7 +516,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "simples";')
+cur.execute('DROP TABLE IF EXISTS "rfb.simples";')
 conn.commit()
 
 for e in range(0, len(arquivos_simples)):
@@ -524,7 +571,7 @@ for e in range(0, len(arquivos_simples)):
 
         # Gravar dados no banco:
         # simples
-        to_sql(simples, name='simples', con=engine, if_exists='append', index=False)
+        to_sql(simples, name='simples', schema='rfb', con=engine, if_exists='append', index=False)
         print('Arquivo ' + arquivos_simples[e] + ' inserido com sucesso no banco de dados! - Parte '+ str(i+1))
 
         try:
@@ -552,7 +599,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "cnae";')
+cur.execute('DROP TABLE IF EXISTS "rfb.cnae";')
 conn.commit()
 
 for e in range(0, len(arquivos_cnae)):
@@ -575,7 +622,7 @@ for e in range(0, len(arquivos_cnae)):
 
     # Gravar dados no banco:
     # cnae
-    to_sql(cnae, name='cnae', con=engine, if_exists='append', index=False)
+    to_sql(cnae, name='cnae', con=engine, schema='rfb', if_exists='append', index=False)
     print('Arquivo ' + arquivos_cnae[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -597,7 +644,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "moti";')
+cur.execute('DROP TABLE IF EXISTS "rfb.moti";')
 conn.commit()
 
 for e in range(0, len(arquivos_moti)):
@@ -620,7 +667,7 @@ for e in range(0, len(arquivos_moti)):
 
     # Gravar dados no banco:
     # moti
-    to_sql(moti, name='moti', con=engine, if_exists='append', index=False)
+    to_sql(moti, name='moti', con=engine, schema='rfb', if_exists='append', index=False)
     print('Arquivo ' + arquivos_moti[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -642,7 +689,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "munic";')
+cur.execute('DROP TABLE IF EXISTS "rfb.munic";')
 conn.commit()
 
 for e in range(0, len(arquivos_munic)):
@@ -665,7 +712,7 @@ for e in range(0, len(arquivos_munic)):
 
     # Gravar dados no banco:
     # munic
-    to_sql(munic, name='munic', con=engine, if_exists='append', index=False)
+    to_sql(munic, name='munic', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_munic[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -687,7 +734,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "natju";')
+cur.execute('DROP TABLE IF EXISTS "rfb.natju";')
 conn.commit()
 
 for e in range(0, len(arquivos_natju)):
@@ -710,7 +757,7 @@ for e in range(0, len(arquivos_natju)):
 
     # Gravar dados no banco:
     # natju
-    to_sql(natju, name='natju', con=engine, if_exists='append', index=False)
+    to_sql(natju, name='natju', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_natju[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -732,7 +779,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "pais";')
+cur.execute('DROP TABLE IF EXISTS "rfb.pais";')
 conn.commit()
 
 for e in range(0, len(arquivos_pais)):
@@ -755,7 +802,7 @@ for e in range(0, len(arquivos_pais)):
 
     # Gravar dados no banco:
     # pais
-    to_sql(pais, name='pais', con=engine, if_exists='append', index=False)
+    to_sql(pais, name='pais', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_pais[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -777,7 +824,7 @@ print("""
 """)
 
 # Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "quals";')
+cur.execute('DROP TABLE IF EXISTS "rfb.quals";')
 conn.commit()
 
 for e in range(0, len(arquivos_quals)):
@@ -800,7 +847,7 @@ for e in range(0, len(arquivos_quals)):
 
     # Gravar dados no banco:
     # quals
-    to_sql(quals, name='quals', con=engine, if_exists='append', index=False)
+    to_sql(quals, name='quals', schema='rfb', con=engine, if_exists='append', index=False)
     print('Arquivo ' + arquivos_quals[e] + ' inserido com sucesso no banco de dados!')
 
 try:
@@ -841,13 +888,13 @@ print("""
 #######################################
 """)
 cur.execute("""
-create index if not exists empresa_cnpj on empresa(cnpj_basico);
+create index if not exists empresa_cnpj on rfb.empresa(cnpj_basico);
 commit;
-create index if not exists estabelecimento_cnpj on estabelecimento(cnpj_basico);
+create index if not exists estabelecimento_cnpj on rfb.estabelecimento(cnpj_basico);
 commit;
-create index if not exists socios_cnpj on socios(cnpj_basico);
+create index if not exists socios_cnpj on rfb.socios(cnpj_basico);
 commit;
-create index if not exists simples_cnpj on simples(cnpj_basico);
+create index if not exists simples_cnpj on rfb.simples(cnpj_basico);
 commit;
 """)
 conn.commit()
