@@ -84,7 +84,7 @@ print(dotenv_path)
 load_dotenv(dotenv_path=dotenv_path)
 
 # URL de referencia da receita para baixar os arquivos .zip
-base_url = input("Please enter the base URL (e.g., http://200.152.38.155/CNPJ/dados_abertos_cnpj/2024-09/): ").strip()
+base_url = input("Please enter the base URL (e.g., https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-02/): ").strip()
 
 if not base_url.startswith("http://") and not base_url.startswith("https://"):
     print("Invalid URL. Please make sure it starts with 'http://' or 'https://'.")
@@ -278,6 +278,7 @@ passw=getEnv('DB_PASSWORD')
 host=getEnv('DB_HOST')
 port=getEnv('DB_PORT')
 database=getEnv('DB_NAME')
+
 
 # Conectar:
 engine = create_engine('postgresql://'+user+':'+passw+'@'+host+':'+port+'/'+database)
