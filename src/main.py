@@ -1,23 +1,21 @@
-import datetime
+import argparse
 import gc
-import pathlib
-from dotenv import load_dotenv
-from sqlalchemy import create_engine
-import bs4 as bs
-import ftplib
-import gzip
 import os
-import pandas as pd
-import psycopg2
+import pathlib
 import re
 import sys
 import time
-import requests
-import urllib.request
-import wget
+import xml.etree.ElementTree as ET
 import zipfile
+from datetime import date
+from urllib.parse import unquote
+
+import pandas as pd
+import psycopg2
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
+from sqlalchemy import create_engine
 from urllib3.util.retry import Retry
 
 
@@ -37,6 +35,26 @@ def check_diff(url, file_name):
         return True # tamanho diferentes
 
     return False # arquivos sao iguais
+
+
+def is_already_extracted(zip_path, extract_dir):
+    '''
+    Verifica se todos os arquivos contidos no zip já foram extraídos
+    no diretório de destino com o tamanho correto.
+    '''
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                dest = os.path.join(extract_dir, info.filename)
+                if not os.path.isfile(dest):
+                    return False
+                if os.path.getsize(dest) != info.file_size:
+                    return False
+        return True
+    except Exception:
+        return False
 
 
 #%%
@@ -83,12 +101,27 @@ if not os.path.isfile(dotenv_path):
 print(dotenv_path)
 load_dotenv(dotenv_path=dotenv_path)
 
-# URL de referencia da receita para baixar os arquivos .zip
-base_url = input("Please enter the base URL (e.g., https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-02/): ").strip()
+# Período de referência dos dados (ano + mês)
+parser = argparse.ArgumentParser()
+parser.add_argument('--year',  type=str, default=None)
+parser.add_argument('--month', type=str, default=None)
+args, _ = parser.parse_known_args()
 
-if not base_url.startswith("http://") and not base_url.startswith("https://"):
-    print("Invalid URL. Please make sure it starts with 'http://' or 'https://'.")
-    exit(1)
+_today = date.today()
+if args.year and args.month:
+    reference_year  = args.year.strip()
+    reference_month = args.month.strip().zfill(2)
+else:
+    reference_year  = input(f"Ano de referência (padrão: {_today.year}): ").strip() or str(_today.year)
+    reference_month = input(f"Mês de referência (padrão: {str(_today.month).zfill(2)}): ").strip().zfill(2) \
+                      or str(_today.month).zfill(2)
+
+if not re.fullmatch(r'\d{4}', reference_year) or not (1 <= int(reference_month) <= 12):
+    print("Erro: período inválido.")
+    sys.exit(1)
+
+period_path = f"{getEnv('NEXTCLOUD_DATA_PATH')}/{reference_year}-{reference_month}"
+print(f"Período de referência: {reference_year}-{reference_month}")
 
 #%%
 # Read details from ".env" file:
@@ -109,99 +142,79 @@ except:
     print('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
 
 #%%
-raw_html = urllib.request.urlopen(base_url)
-raw_html = raw_html.read()
+# Sessão HTTP compartilhada com retry (reutilizada em PROPFIND e downloads)
+_retry = Retry(
+    total=5, backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "PROPFIND"],
+)
+_adapter = HTTPAdapter(max_retries=_retry)
+http = requests.Session()
+http.mount("https://", _adapter)
+http.mount("http://",  _adapter)
 
-# Formatar página e converter em string
-page_items = bs.BeautifulSoup(raw_html, 'lxml')
-html_str = str(page_items)
+# Listagem de arquivos via WebDAV PROPFIND
+_nc_base  = getEnv('NEXTCLOUD_BASE_URL')
+_nc_token = getEnv('NEXTCLOUD_SHARE_TOKEN')
+_propfind_url = f"{_nc_base}/public.php/dav/files/{_nc_token}{period_path}/"
 
-# Obter arquivos
+_resp = http.request("PROPFIND", _propfind_url, headers={"Depth": "1"}, timeout=30)
+if _resp.status_code != 207:
+    raise RuntimeError(
+        f"PROPFIND falhou (HTTP {_resp.status_code}). "
+        f"Verifique NEXTCLOUD_SHARE_TOKEN e NEXTCLOUD_DATA_PATH no .env."
+    )
+
+_root = ET.fromstring(_resp.text)
+_ns   = {"d": "DAV:"}
 Files = []
-text = '.zip'
-for m in re.finditer(text, html_str):
-    i_start = m.start()-40
-    i_end = m.end()
-    i_loc = html_str[i_start:i_end].find('href=')+6
-    Files.append(html_str[i_start+i_loc:i_end])
+for _response in _root.findall("d:response", _ns):
+    _href     = _response.findtext("d:href", namespaces=_ns) or ""
+    _filename = unquote(_href.rstrip("/").split("/")[-1])
+    if _filename.lower().endswith(".zip"):
+        Files.append(_filename)
 
-# Correcao do nome dos arquivos devido a mudanca na estrutura do HTML da pagina - 31/07/22 - Aphonso Rafael
-Files_clean = []
-for i in range(len(Files)):
-    if not Files[i].find('.zip">') > -1:
-        Files_clean.append(Files[i])
-
-try:
-    del Files
-except:
-    pass
-
-Files = Files_clean
+# TODO: remover este filtro para processar todos os arquivos
+# Files = [f for f in Files if f == 'Cnaes.zip']
 
 print('Arquivos que serão baixados:')
-i_f = 0
-for f in Files:
-    i_f += 1
+for i_f, f in enumerate(Files, 1):
     print(str(i_f) + ' - ' + f)
 
 #%%
 ########################################################################################################################
 ## DOWNLOAD ############################################################################################################
 ########################################################################################################################
-# Create this bar_progress method which is invoked automatically from wget:
-def bar_progress(current, total, width=80):
-  progress_message = "Downloading: %d%% [%d / %d] bytes - " % (current / total * 100, current, total)
-  # Don't use print() as it will print in new line every time.
-  sys.stdout.write("\r" + progress_message)
-  sys.stdout.flush()
+_chunk_sz = 1 * 1024 * 1024  # 1 MB
 
-#%%
-# Download arquivos ################################################################################################################################
-i_l = 0
 for l in Files:
-    # Download dos arquivos
-    i_l += 1
-    print('Baixando arquivo:')
+    _url  = f"{_nc_base}/public.php/dav/files/{_nc_token}{period_path}/{l}"
+    _dest = os.path.join(output_files, l)
 
+    if not check_diff(_url, _dest):
+        print(f"Arquivo {l} já existe e está atualizado, pulando download.")
+        continue
 
-    # Configurar cabeçalhos e retentativas
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    retry_strategy = Retry(
-    total=5, # Tenta até 5 vezes
-    backoff_factor=1, # Aumenta o tempo de espera entre as tentativas
-    status_forcelist=[429, 500, 502, 503, 504], # Requer retentativas em erros comuns
-    allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    http = requests.Session()
-    http.mount("https://", adapter)
-    http.mount("http://", adapter)
+    print(f"Baixando: {_url}")
+    _response = http.get(_url, stream=True, timeout=60)
 
-    # Testar conexão com a URL antes de iniciar os downloads
+    if _response.status_code not in (200, 206):
+        print(f"Erro ao baixar {l}: HTTP {_response.status_code}")
+        continue
+
     try:
-        test_response = requests.head(base_url, headers={'User-Agent': 'Mozilla/5.0'})
-        if test_response.status_code == 200:
-            print("Conexão com o servidor bem-sucedida!")
-        else:
-            print(f"Erro: O servidor respondeu com status {test_response.status_code}.")
-            sys.exit(1)
+        _downloaded = 0
+        with open(_dest, 'wb') as f:
+            for _chunk in _response.iter_content(_chunk_sz):
+                f.write(_chunk)
+                _downloaded += len(_chunk)
+                print(f"\r    {l}: {_downloaded / 1024 / 1024:.1f} MB", end="", flush=True)
+        print()
+        print(f"Arquivo {l} baixado com sucesso!")
     except Exception as e:
-        print(f"Erro ao conectar ao servidor: {e}")
-        sys.exit(1)
-
-
-    # Realizar download com tratamento de erros
-    try:
-        url = base_url + l # URL completa para o arquivo
-        print(f"Baixando arquivo: {url}")
-        response = http.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Levanta erro se o status não for 200
-
-        with open(os.path.join(output_files, l), 'wb') as f:
-            f.write(response.content)
-            print(f"Arquivo {l} baixado com sucesso!")
-    except requests.exceptions.RequestException as e:
-        print(f"Erro ao baixar o arquivo {l}: {e}")
+        if os.path.exists(_dest):
+            os.remove(_dest)
+        print(f"Erro ao baixar {l}: {e}")
 
 #%%
 # Download layout:
@@ -221,6 +234,9 @@ for l in Files:
         print('Descompactando arquivo:')
         print(str(i_l) + ' - ' + l)
         full_path = os.path.join(output_files, l)
+        if is_already_extracted(full_path, extracted_files):
+            print(f'Arquivo {l} já extraído, pulando descompactação.')
+            continue
         with zipfile.ZipFile(full_path, 'r') as zip_ref:
             zip_ref.extractall(extracted_files)
     except:
