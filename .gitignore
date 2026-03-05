@@ -133,3 +133,5 @@ dmypy.json
 
 EXTRACTED_FILES/**
 OUTPUT_FILES/**
+
+.claude/**
