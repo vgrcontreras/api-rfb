@@ -130,3 +130,6 @@ dmypy.json
 
 .idea/
 *.tmp
+
+EXTRACTED_FILES/**
+OUTPUT_FILES/**
